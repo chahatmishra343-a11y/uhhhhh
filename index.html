@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Hacker Didi // AR Physics Canvas</title>
+    
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+    <style>
+        :root {
+            --neon-blue: #00f0ff;
+            --neon-pink: #ff007f;
+            --panel-bg: rgba(5, 5, 10, 0.85);
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            font-family: 'Courier New', Courier, monospace;
+        }
+
+        body, html {
+            width: 100%;
+            height: 100%;
+            background-color: #000;
+            overflow: hidden;
+            position: relative;
+        }
+
+        /* Full Screen Selfie Mirror Video */
+        #webcam {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            object-fit: cover;
+            transform: scaleX(-1);
+            z-index: 1;
+            filter: brightness(0.5) contrast(1.2);
+        }
+
+        /* Main Drawing and Physics Canvas Layer */
+        #physicsCanvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 5;
+        }
+
+        /* Tracking Skeleton overlay */
+        #trackingOverlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            object-fit: cover;
+            z-index: 3;
+            transform: scaleX(-1);
+            pointer-events: none;
+            opacity: 0.25;
+        }
+
+        /* Control Panel Dashboard */
+        .control-panel {
+            position: absolute;
+            top: 15px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 10;
+            background: var(--panel-bg);
+            border: 1px solid rgba(0, 240, 255, 0.2);
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.6);
+            padding: 10px 15px;
+            border-radius: 20px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 15px;
+            width: 92%;
+            max-width: 550px;
+            backdrop-filter: blur(8px);
+        }
+
+        .panel-group {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        label {
+            font-size: 0.7rem;
+            letter-spacing: 1px;
+            color: var(--neon-blue);
+            font-weight: bold;
+        }
+
+        input[type="color"] {
+            background: transparent;
+            border: none;
+            width: 25px;
+            height: 25px;
+            cursor: pointer;
+        }
+
+        .hud-status {
+            font-size: 0.7rem;
+            font-weight: bold;
+            padding: 4px 10px;
+            border-radius: 15px;
+            background: rgba(0,0,0,0.6);
+            min-width: 120px;
+            text-align: center;
+            border: 1px solid #333;
+        }
+
+        .state-draw { color: #00ff55; border-color: #00ff55; }
+        .state-drag { color: #00f0ff; border-color: #00f0ff; }
+        .state-gravity { color: #ff0055; border-color: #ff0055; animation: blink 1s infinite; }
+        .state-loading { color: #aaa; border-color: #333; }
+
+        .clear-btn {
+            background: transparent;
+            border: 1px solid #ff0055;
+            color: #ff0055;
+            padding: 4px 10px;
+            cursor: pointer;
+            font-size: 0.7rem;
+            border-radius: 15px;
+        }
+
+        @keyframes blink {
+            50% { opacity: 0.5; }
+        }
+
+        @media (min-width: 600px) {
+            .control-panel { padding: 12px 25px; border-radius: 50px; gap: 20px; width: auto; }
+            label { font-size: 0.8rem; }
+            .hud-status, .clear-btn { font-size: 0.8rem; padding: 6px 14px; }
+        }
+    </style>
+</head>
+<body>
+
+    <div class="control-panel">
+        <div class="panel-group">
+            <label>COLOR</label>
+            <input type="color" id="brushColor" value="#ff007f">
+        </div>
+        
+        <button class="clear-btn" onclick="clearCanvas()">CLEAR WORLD</button>
+        <div class="hud-status state-loading" id="hudState">LOADING_MATRIX...</div>
+    </div>
+
+    <video id="webcam" autoplay playsinline></video>
+    <canvas id="trackingOverlay"></canvas>
+    <canvas id="physicsCanvas"></canvas>
+
+    <script>
+        const video = document.getElementById('webcam');
+        const overlayCanvas = document.getElementById('trackingOverlay');
+        const oCtx = overlayCanvas.getContext('2d');
+        const canvas = document.getElementById('physicsCanvas');
+        const ctx = canvas.getContext('2d');
+        const hudState = document.getElementById('hudState');
+        const colorPicker = document.getElementById('brushColor');
+
+        let shapes = [];        // Stores permanent shapes floating/falling in world
+        let currentStroke = []; // Temp coordinates while drawing
+        let lastX = null, lastY = null;
+        
+        let globalGravity = false;
+        let selectedShape = null;
+        let dragOffset = { x: 0, y: 0 };
+
+        function resizeCanvas() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+        }
+        resizeCanvas();
+        window.addEventListener('resize', resizeCanvas);
+
+        function clearCanvas() {
+            shapes = [];
+            currentStroke = [];
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+        }
+
+        // --- INTELLIGENT SHAPE COGNITION ENGINE ---
+        function recognizeAndCreateShape(points, color) {
+            if (points.length < 10) return;
+
+            // Find boundaries of drawing
+            let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+            points.forEach(p => {
+                if (p.x < minX) minX = p.x;
+                if (p.x > maxX) maxX = p.x;
+                if (p.y < minY) minY = p.y;
+                if (p.y > maxY) maxY = p.y;
+            });
+
+            const width = maxX - minX;
+            const height = maxY - minY;
+            const centerX = minX + width / 2;
+            const centerY = minY + height / 2;
+
+            // Check if it's a circle or box based on start/end point distance vs perimeter
+            const startPt = points[0];
+            const endPt = points[points.length - 1];
+            const closureDist = Math.hypot(startPt.x - endPt.x, startPt.y - endPt.y);
+
+            let shapeType = "box"; // Default
+            if (closureDist < 50 && Math.abs(width - height) < 40) {
+                shapeType = "circle";
+            }
+
+            // Push object into physics world arrays
+            shapes.push({
+                type: shapeType,
+                x: centerX,
+                y: centerY,
+                w: Math.max(width, 40),
+                h: Math.max(height, 40),
+                r: Math.max(width, height) / 2,
+                color: color,
+                vy: 0 // velocity Y for gravity falls
+            });
+        }
+
+        // --- GESTURE DETECTOR SUBSYSTEM ---
+        function analyzeHandState(landmarks) {
+            const thumbTip = landmarks[4], indexTip = landmarks[8], indexPip = landmarks[6];
+            const middleTip = landmarks[12], middlePip = landmarks[10];
+            const ringTip = landmarks[16];
+            const pinkyTip = landmarks[20], pinkyPip = landmarks[18];
+
+            const isIndexOut = indexTip.y < indexPip.y;
+            const isMiddleOut = middleTip.y < middlePip.y;
+            const isRingOut = ringTip.y < landmarks[14].y;
+            const isPinkyOut = pinkyTip.y < pinkyPip.y;
+
+            // 1. PINKY OUT = TRIGGER GRAVITY SYSTEM
+            if (isPinkyOut && !isIndexOut && !isMiddleOut) {
+                return "GRAVITY_TRIGGER";
+            }
+
+            // 2. INDEX & MIDDLE PINCHED TOGETHER = DRAG/MOVE MODE
+            const dragPinchGap = Math.hypot(indexTip.x - middleTip.x, indexTip.y - middleTip.y);
+            if (isIndexOut && isMiddleOut && dragPinchGap < 0.04) {
+                return "DRAG";
+            }
+
+            // 3. ONLY INDEX OUT = DRAWING SHAPE MODE
+            if (isIndexOut && !isMiddleOut) {
+                return "DRAW";
+            }
+
+            return "HOVER";
+        }
+
+        // --- MAIN PIPELINE HANDLER ---
+        function onResults(results) {
+            if(overlayCanvas.width !== video.videoWidth) {
+                overlayCanvas.width = video.videoWidth;
+                overlayCanvas.height = video.videoHeight;
+            }
+            oCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                const hand = results.multiHandLandmarks[0];
+                
+                // Render neon wireframes on camera view
+                drawConnectors(oCtx, hand, HAND_CONNECTIONS, {color: '#ff007f', lineWidth: 2});
+                drawLandmarks(oCtx, hand, {color: '#00f0ff', radius: 3});
+
+                const mode = analyzeHandState(hand);
+                const rawX = (1 - hand[8].x) * canvas.width;
+                const rawY = hand[8].y * canvas.height;
+
+                if (mode === "GRAVITY_TRIGGER") {
+                    globalGravity = true;
+                    hudState.innerText = "GRAVITY_MODE";
+                    hudState.className = "hud-status state-gravity";
+                    // Terminate active drawing selections
+                    if (currentStroke.length > 0) {
+                        recognizeAndCreateShape(currentStroke, colorPicker.value);
+                        currentStroke = [];
+                    }
+                    selectedShape = null;
+                } 
+                else if (mode === "DRAW") {
+                    globalGravity = false;
+                    hudState.innerText = "DRAW_SHAPE";
+                    hudState.className = "hud-status state-draw";
+                    
+                    currentStroke.push({ x: rawX, y: rawY });
+                    selectedShape = null;
+                } 
+                else if (mode === "DRAG") {
+                    globalGravity = false;
+                    hudState.innerText = "DRAG_OBJECT";
+                    hudState.className = "hud-status state-drag";
+
+                    // Finish drawing if switching directly to drag
+                    if (currentStroke.length > 0) {
+                        recognizeAndCreateShape(currentStroke, colorPicker.value);
+                        currentStroke = [];
+                    }
+
+                    // Look for shapes underneath your index finger intersection point
+                    if (!selectedShape) {
+                        shapes.forEach(shape => {
+                            let hit = false;
+                            if (shape.type === "box" && Math.abs(rawX - shape.x) < shape.w/2 && Math.abs(rawY - shape.y) < shape.h/2) hit = true;
+                            if (shape.type === "circle" && Math.hypot(rawX - shape.x, rawY - shape.y) < shape.r) hit = true;
+                            
+                            if (hit) {
+                                selectedShape = shape;
+                                dragOffset.x = rawX - shape.x;
+                                dragOffset.y = rawY - shape.y;
+                            }
+                        });
+                    } else {
+                        // Move the captured geometry coordinates live
+                        selectedShape.x = rawX - dragOffset.x;
+                        selectedShape.y = rawY - dragOffset.y;
+                        selectedShape.vy = 0; // Freeze velocity vectors
+                    }
+                } 
+                else {
+                    // Hover/Resting states -> close loops and clear selection locks
+                    if (currentStroke.length > 0) {
+                        recognizeAndCreateShape(currentStroke, colorPicker.value);
+                        currentStroke = [];
+                    }
+                    selectedShape = null;
+                    if (!globalGravity) {
+                        hudState.innerText = "SYSTEM_READY";
+                        hudState.className = "hud-status state-draw";
+                    }
+                }
+            } else {
+                if (currentStroke.length > 0) {
+                    recognizeAndCreateShape(currentStroke, colorPicker.value);
+                    currentStroke = [];
+                }
+                selectedShape = null;
+                if (!globalGravity) {
+                    hudState.innerText = "AWAITING_HAND";
+                    hudState.className = "hud-status state-loading";
+                }
+            }
+        }
+
+        // --- PHYSICS CORE DRAW REFRESH TICK LOOP ---
+        function loop() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            // 1. Draw temporary stroke lines while tracing shapes in air
+            if (currentStroke.length > 1) {
+                ctx.beginPath();
+                ctx.moveTo(currentStroke[0].x, currentStroke[0].y);
+                for(let i=1; i<currentStroke.length; i++) {
+                    ctx.lineTo(currentStroke[i].x, currentStroke[i].y);
+                }
+                ctx.strokeStyle = colorPicker.value;
+                ctx.lineWidth = 5;
+                ctx.lineCap = 'round';
+                ctx.shadowColor = colorPicker.value;
+                ctx.shadowBlur = 10;
+                ctx.stroke();
+            }
+
+            // 2. Process and Render permanent physics engine items
+            shapes.forEach(shape => {
+                if (globalGravity && shape !== selectedShape) {
+                    shape.vy += 0.4; // Simulate earth gravitational acceleration rate
+                    shape.y += shape.vy;
+
+                    // Ground baseline collision check metrics
+                    const groundLimit = canvas.height - (shape.type === "box" ? shape.h/2 : shape.r);
+                    if (shape.y >= groundLimit) {
+                        shape.y = groundLimit;
+                        shape.vy *= -0.4; // Add realistic energy bounce decay!
+                    }
+                }
+
+                // Render styles with premium neon aesthetic designs
+                ctx.beginPath();
+                ctx.strokeStyle = shape.color;
+                ctx.lineWidth = 6;
+                ctx.shadowColor = shape.color;
+                ctx.shadowBlur = 15;
+
+                if (shape.type === "box") {
+                    ctx.strokeRect(shape.x - shape.w/2, shape.y - shape.h/2, shape.w, shape.h);
+                    
+                    // Neon Core Accent line
+                    ctx.shadowBlur = 0;
+                    ctx.strokeStyle = "#ffffff";
+                    ctx.lineWidth = 1.5;
+                    ctx.strokeRect(shape.x - shape.w/2, shape.y - shape.h/2, shape.w, shape.h);
+                } else {
+                    ctx.arc(shape.x, shape.y, shape.r, 0, Math.PI * 2);
+                    ctx.stroke();
+
+                    // Neon Core Accent line
+                    ctx.shadowBlur = 0;
+                    ctx.strokeStyle = "#ffffff";
+                    ctx.lineWidth = 1.5;
+                    ctx.stroke();
+                }
+            });
+
+            requestAnimationFrame(loop);
+        }
+
+        // --- LIFECYCLE INITIALIZATION DEPLOYMENT ---
+        const hands = new Hands({
+            locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+        });
+
+        hands.setOptions({
+            maxNumHands: 1,
+            modelComplexity: 1,
+            minDetectionConfidence: 0.6,
+            minTrackingConfidence: 0.6
+        });
+        hands.onResults(onResults);
+
+        const cameraPipe = new Camera(video, {
+            onFrame: async () => { await hands.send({image: video}); },
+            facingMode: 'user',
+            width: window.innerWidth > 600 ? 640 : 320,
+            height: window.innerWidth > 600 ? 480 : 240
+        });
+
+        cameraPipe.start().then(() => {
+            loop(); // Start calculations once video locks stream feeds
+        });
+    </script>
+</body>
+</html>
